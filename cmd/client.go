@@ -1,8 +1,13 @@
 package main
 
 import (
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"io"
-	"net"
+	"io/ioutil"
 	"strings"
 
 	kvgo "github.com/caelansar/kv-go"
@@ -73,7 +78,36 @@ func (c *Client) execute(req *abi.CommandRequest) (*abi.CommandResponse, error) 
 }
 
 func NewClient(addr string, logger *zap.SugaredLogger, codec kvgo.Codec) (client *Client, err error) {
-	conn, err := net.Dial("tcp", addr)
+	key, err := parseKey("../certs/client.key")
+	if err != nil {
+		return nil, err
+	}
+	clientCert, err := parseCertificate("../certs/client.crt")
+	if err != nil {
+		return nil, err
+	}
+	caCert, err := parseCertificate("../certs/ca.crt")
+	if err != nil {
+		return nil, err
+	}
+	certPool := x509.NewCertPool()
+	certPool.AddCert(caCert)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{
+			{
+				Certificate: [][]byte{clientCert.Raw},
+				PrivateKey:  key,
+			},
+		},
+		RootCAs: certPool,
+		NextProtos: []string{
+			"kv",
+		},
+		ServerName: "kv.test.com",
+	}
+
+	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
 		return
 	}
@@ -96,4 +130,31 @@ func NewClient(addr string, logger *zap.SugaredLogger, codec kvgo.Codec) (client
 		stream: stream,
 	}
 	return
+}
+
+func parseCertificate(crt string) (*x509.Certificate, error) {
+	certPEMBlock, err := ioutil.ReadFile(crt)
+	if err != nil {
+		return nil, err
+	}
+	certDERBlock, _ := pem.Decode(certPEMBlock)
+	return x509.ParseCertificate(certDERBlock.Bytes)
+}
+
+func parseKey(key string) (*rsa.PrivateKey, error) {
+	keyPEMBlock, err := ioutil.ReadFile(key)
+	if err != nil {
+		return nil, err
+	}
+
+	keyDERBlock, _ := pem.Decode(keyPEMBlock)
+	if keyDERBlock == nil {
+		return nil, err
+	}
+	if keyDERBlock.Type == "RSA PRIVATE KEY" {
+		key, err := x509.ParsePKCS1PrivateKey(keyDERBlock.Bytes)
+		return key, err
+	} else {
+		return nil, errors.New("not support")
+	}
 }
