@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/ioutil"
 	"strings"
+	"time"
 
 	kvgo "github.com/caelansar/kv-go"
 	abi "github.com/caelansar/kv-go/pb"
@@ -51,12 +52,140 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	publish := &abi.CommandRequest_Publish{
+		Publish: &abi.Publish{
+			Topic: "cae",
+			Data: []*abi.Value{
+				{
+					Value: &abi.Value_String_{"hello"},
+				},
+				{
+					Value: &abi.Value_String_{"world"},
+				},
+			},
+		},
+	}
+
+	publish1 := &abi.CommandRequest_Publish{
+		Publish: &abi.Publish{
+			Topic: "cae",
+			Data: []*abi.Value{
+				{
+					Value: &abi.Value_String_{"?"},
+				},
+			},
+		},
+	}
+
+	subscribe := &abi.CommandRequest_Subscribe{
+		Subscribe: &abi.Subscribe{
+			Topic: "cae",
+		},
+	}
+
+	sr, err := client.executeStreaming(&abi.CommandRequest{RequestData: subscribe})
+	if err != nil {
+		panic(err)
+	}
+
+	go func() {
+		_, err = client.execute(&abi.CommandRequest{RequestData: publish})
+		if err != nil {
+			panic(err)
+		}
+		l.Sugar().Info("publish success")
+
+		time.Sleep(100 * time.Millisecond)
+		_, err = client.execute(&abi.CommandRequest{RequestData: publish1})
+		if err != nil {
+			panic(err)
+		}
+		l.Sugar().Info("publish success")
+	}()
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		unsubscribe := &abi.CommandRequest_Unsubscribe{
+			Unsubscribe: &abi.Unsubscribe{
+				Topic: "cae",
+				Id:    sr.id,
+			},
+		}
+		_, err = client.execute(&abi.CommandRequest{RequestData: unsubscribe})
+		if err != nil {
+			panic(err)
+		}
+		l.Sugar().Info("unsubscribe success")
+	}()
+
+	for data := range sr.ch {
+		l.Sugar().Debugw("receive published data", "data", data, "subscription id", sr.id)
+	}
+
 }
 
 type Client struct {
-	logger *zap.SugaredLogger
-	codec  kvgo.Codec
-	stream io.ReadWriter
+	logger  *zap.SugaredLogger
+	codec   kvgo.Codec
+	stream  io.ReadWriteCloser
+	session *yamux.Session
+}
+
+type StreamResult struct {
+	id uint32
+	ch <-chan *abi.CommandResponse
+}
+
+func (s *StreamResult) Id() uint32 {
+	return s.id
+}
+
+func (c *Client) executeStreaming(req *abi.CommandRequest) (*StreamResult, error) {
+	stream, err := c.session.Open()
+	if err != nil {
+		return nil, err
+	}
+	protoReq, err := c.codec.Encode(req)
+	if err != nil {
+		return nil, err
+	}
+	c.logger.Debugf("write streaming req: %#v", req)
+	_, err = stream.Write(protoReq)
+	if err != nil {
+		return nil, err
+	}
+
+	var ch = make(chan *abi.CommandResponse, 10)
+	resp, err := c.codec.Decode(stream)
+	if err != nil {
+		c.logger.Errorw("failed to decode id", "err", err)
+		return nil, err
+	}
+	id := resp.Values[0].GetInteger()
+	c.logger.Debugw("get id success", "id", id)
+
+	go func() {
+		for {
+			resp, err := c.codec.Decode(stream)
+			if err != nil {
+				c.logger.Errorw("failed to decode", "err", err, "eof", err == io.EOF)
+				close(ch)
+				break
+			}
+			if resp.Status == 0 {
+				c.logger.Info("receive cancel")
+				close(ch)
+				break
+			}
+			ch <- resp
+			c.logger.Debugw("get streaming resp", "resp", resp)
+		}
+	}()
+	return &StreamResult{
+		id: uint32(id),
+		ch: ch,
+	}, nil
 }
 
 func (c *Client) execute(req *abi.CommandRequest) (*abi.CommandResponse, error) {
@@ -125,9 +254,10 @@ func NewClient(addr string, logger *zap.SugaredLogger, codec kvgo.Codec) (client
 	}
 
 	client = &Client{
-		logger: logger,
-		codec:  codec,
-		stream: stream,
+		logger:  logger,
+		codec:   codec,
+		stream:  stream,
+		session: session,
 	}
 	return
 }
